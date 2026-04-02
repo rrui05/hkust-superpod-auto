@@ -198,14 +198,31 @@ func findDotenv() string {
 			return p
 		}
 	}
-	// 2. Try cwd, then walk up
-	dir, _ := os.Getwd()
-	for i := 0; i < 5 && dir != "/"; i++ {
-		p := filepath.Join(dir, ".env")
-		if _, err := os.Stat(p); err == nil {
-			return p
+	seen := map[string]bool{}
+	searchRoots := []string{}
+	if cwd, err := os.Getwd(); err == nil && cwd != "" {
+		searchRoots = append(searchRoots, cwd)
+	}
+	if exe, err := os.Executable(); err == nil && exe != "" {
+		searchRoots = append(searchRoots, filepath.Dir(exe))
+		if realExe, err := filepath.EvalSymlinks(exe); err == nil && realExe != "" {
+			searchRoots = append(searchRoots, filepath.Dir(realExe))
 		}
-		dir = filepath.Dir(dir)
+	}
+	// 2. Try cwd and executable directories, then walk up.
+	for _, root := range searchRoots {
+		dir := root
+		for i := 0; i < 8 && dir != "/" && dir != "." && dir != ""; i++ {
+			if seen[dir] {
+				break
+			}
+			seen[dir] = true
+			p := filepath.Join(dir, ".env")
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+			dir = filepath.Dir(dir)
+		}
 	}
 	return ""
 }
@@ -230,6 +247,48 @@ func info(msg string) { fmt.Fprintf(os.Stderr, "  %s›%s %s\n", cBlue, reset, m
 func ok(msg string)   { fmt.Fprintf(os.Stderr, "  %s✓%s %s\n", cGreen, reset, msg) }
 func warn(msg string) { fmt.Fprintf(os.Stderr, "  %s⚠%s %s\n", cAmber, reset, msg) }
 func fail(msg string) { fmt.Fprintf(os.Stderr, "  %s✗%s %s\n", cRed, reset, msg) }
+
+var spodDebugLogPath = filepath.Join(os.TempDir(), "spod-debug.log")
+var spodDebugMu sync.Mutex
+
+func shortenForLog(s string, limit int) string {
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	s = strings.ReplaceAll(s, "\r", `\r`)
+	if len(s) <= limit {
+		return s
+	}
+	if limit < 4 {
+		return s[:limit]
+	}
+	return s[:limit-3] + "..."
+}
+
+func summarizeArgs(args []string) string {
+	if len(args) == 0 {
+		return "(none)"
+	}
+	parts := make([]string, 0, len(args))
+	for _, arg := range args {
+		parts = append(parts, shortenForLog(arg, 160))
+	}
+	return strings.Join(parts, " | ")
+}
+
+func debugLogf(component, format string, args ...any) {
+	line := fmt.Sprintf("%s [%s] %s\n",
+		time.Now().Format("2006-01-02 15:04:05"),
+		component,
+		fmt.Sprintf(format, args...),
+	)
+	spodDebugMu.Lock()
+	defer spodDebugMu.Unlock()
+	f, err := os.OpenFile(spodDebugLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.WriteString(line)
+}
 
 // ── Validation ──
 
@@ -260,6 +319,7 @@ func ssh(args ...string) (string, error) {
 	useStdin := len(args) == 1 && strings.Contains(args[0], "\n")
 
 	for attempt := 0; ; attempt++ {
+		debugLogf("ssh", "start attempt=%d host=%s args=%s", attempt+1, host, summarizeArgs(args))
 		var cmd *exec.Cmd
 		if useStdin {
 			cmd = exec.Command("ssh", "-o", "ConnectTimeout=5", host, "bash -s")
@@ -272,14 +332,17 @@ func ssh(args ...string) (string, error) {
 		cmd.Stderr = &stderr
 		err := cmd.Run()
 		if err == nil {
+			debugLogf("ssh", "ok attempt=%d stdout=%s", attempt+1, shortenForLog(strings.TrimSpace(stdout.String()), 240))
 			return strings.TrimSpace(stdout.String()), nil
 		}
 		if isSSHConnErr(err) && attempt < maxRetries {
+			debugLogf("ssh", "retryable error attempt=%d err=%v stderr=%s", attempt+1, err, shortenForLog(strings.TrimSpace(stderr.String()), 240))
 			warn(fmt.Sprintf("SSH 连接被重置，%v 后重试 (%d/%d)...", delays[attempt], attempt+1, maxRetries))
 			time.Sleep(delays[attempt])
 			continue
 		}
 		errMsg := strings.TrimSpace(stderr.String())
+		debugLogf("ssh", "failed attempt=%d err=%v stderr=%s stdout=%s", attempt+1, err, shortenForLog(errMsg, 240), shortenForLog(strings.TrimSpace(stdout.String()), 240))
 		if errMsg != "" {
 			return strings.TrimSpace(stdout.String()), fmt.Errorf("%w: %s", err, errMsg)
 		}
@@ -291,11 +354,17 @@ func sshInteractive(args ...string) error {
 	const maxRetries = 3
 	delays := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
 	for attempt := 0; ; attempt++ {
+		debugLogf("ssh-interactive", "start attempt=%d host=%s args=%s", attempt+1, host, summarizeArgs(args))
 		cmd := exec.Command("ssh", append([]string{"-t", "-o", "ConnectTimeout=10", host}, args...)...)
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		err := cmd.Run()
+		if err == nil {
+			debugLogf("ssh-interactive", "ok attempt=%d", attempt+1)
+		} else {
+			debugLogf("ssh-interactive", "exit attempt=%d err=%v", attempt+1, err)
+		}
 		if err == nil || !isSSHConnErr(err) || attempt >= maxRetries {
 			return err
 		}
@@ -306,20 +375,21 @@ func sshInteractive(args ...string) error {
 
 // ── Tunnel ──
 
-// tunnelPID finds the autossh process managing our tunnel.
-// Verifies via /proc/PID/cmdline to avoid pgrep self-matches and
-// child ssh process false positives.
-func tunnelPID() int {
-	cmd := exec.Command("pgrep", "-f", "autossh.*-R "+tunnelPort+":127.0.0.1:"+localPort)
+// tunnelPIDs finds autossh processes using our remote tunnel port.
+// Verifies via /proc/PID/cmdline to avoid pgrep self-matches and child ssh
+// process false positives.
+func tunnelPIDs() []int {
+	cmd := exec.Command("pgrep", "-f", "autossh.*-R "+tunnelPort+":127.0.0.1:")
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	if err := cmd.Run(); err != nil {
-		return 0
+		return nil
 	}
 	out := strings.TrimSpace(stdout.String())
 	if out == "" {
-		return 0
+		return nil
 	}
+	var pids []int
 	for _, line := range strings.Split(out, "\n") {
 		pid, err := strconv.Atoi(strings.TrimSpace(line))
 		if err != nil || pid <= 0 {
@@ -330,14 +400,63 @@ func tunnelPID() int {
 			continue // process already gone (pgrep self-match)
 		}
 		if strings.Contains(string(cmdline), "autossh") {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
+}
+
+func tunnelCmdline(pid int) string {
+	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return ""
+	}
+	return strings.ReplaceAll(string(cmdline), "\x00", " ")
+}
+
+// tunnelPID returns the autossh PID matching the configured remote/local port pair.
+func tunnelPID() int {
+	want := fmt.Sprintf("-R %s:127.0.0.1:%s", tunnelPort, localPort)
+	for _, pid := range tunnelPIDs() {
+		if strings.Contains(tunnelCmdline(pid), want) {
 			return pid
 		}
 	}
 	return 0
 }
 
+func tunnelState() (desired []int, conflicting []int) {
+	want := fmt.Sprintf("-R %s:127.0.0.1:%s", tunnelPort, localPort)
+	for _, pid := range tunnelPIDs() {
+		cmdline := tunnelCmdline(pid)
+		if cmdline == "" {
+			continue
+		}
+		if strings.Contains(cmdline, want) {
+			desired = append(desired, pid)
+		} else {
+			conflicting = append(conflicting, pid)
+		}
+	}
+	return desired, conflicting
+}
+
+func localProxyReachable(timeout time.Duration) bool {
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:"+localPort, timeout)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
 func ensureVPN() {
 	if vpnTunnelUp() {
+		return
+	}
+	if superpodReachable(3 * time.Second) {
+		debugLogf("vpn", "tun0 missing but %s:22 reachable directly; continuing without VPN", envOr("SUPERPOD_HOST", "superpod.ust.hk"))
+		warn("tun0 不存在，但 SuperPod 可直接访问；继续建立 SSH 隧道")
 		return
 	}
 	fail("VPN 未连接 — tun0 不存在")
@@ -347,6 +466,13 @@ func ensureVPN() {
 
 func ensureTunnel() {
 	ensureVPN()
+	debugLogf("tunnel", "ensure start tunnel_port=%s local_port=%s host=%s", tunnelPort, localPort, host)
+	if !localProxyReachable(2 * time.Second) {
+		debugLogf("tunnel", "local proxy unreachable addr=127.0.0.1:%s", localPort)
+		fail(fmt.Sprintf("本地代理不可达: 127.0.0.1:%s", localPort))
+		fail("检查 Clash/代理端口配置后重试")
+		os.Exit(1)
+	}
 	// Lockfile to prevent concurrent tunnel starts
 	lockPath := filepath.Join(os.TempDir(), "spod-tunnel.lock")
 	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0600)
@@ -360,18 +486,26 @@ func ensureTunnel() {
 		}()
 	}
 
-	pid := tunnelPID()
-	if pid > 0 {
-		// PID exists — verify the underlying SSH connection is still alive
+	desiredPIDs, conflictingPIDs := tunnelState()
+	if len(desiredPIDs) == 1 && len(conflictingPIDs) == 0 {
 		probe := exec.Command("ssh", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes", host, "true")
-		if err := probe.Run(); err != nil {
-			warn(fmt.Sprintf("隧道进程存在 (pid=%d) 但 SSH 连接已断，重建...", pid))
-			syscall.Kill(pid, syscall.SIGTERM)
-			time.Sleep(1 * time.Second)
-		} else {
-			ok(fmt.Sprintf("隧道运行中 (pid=%d)", pid))
+		if probeErr := probe.Run(); probeErr == nil {
+			debugLogf("tunnel", "already running pid=%d", desiredPIDs[0])
+			ok(fmt.Sprintf("隧道运行中 (pid=%d)", desiredPIDs[0]))
 			return
 		}
+		debugLogf("tunnel", "stale desired tunnel pid=%d", desiredPIDs[0])
+		warn(fmt.Sprintf("隧道进程存在 (pid=%d) 但 SSH 连接已断，重建...", desiredPIDs[0]))
+	}
+
+	allPIDs := tunnelPIDs()
+	if len(allPIDs) > 0 {
+		debugLogf("tunnel", "restart required desired=%v conflicting=%v all=%v", desiredPIDs, conflictingPIDs, allPIDs)
+		info(fmt.Sprintf("清理旧隧道并重建 (远端:%s -> 本地:%s)...", tunnelPort, localPort))
+		for _, pid := range allPIDs {
+			_ = syscall.Kill(pid, syscall.SIGTERM)
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 
 	info(fmt.Sprintf("启动隧道 (SuperPod:%s → 本地:%s)...", tunnelPort, localPort))
@@ -396,6 +530,7 @@ func ensureTunnel() {
 		cmd.Stderr = logFile
 	}
 	if err := cmd.Run(); err != nil {
+		debugLogf("tunnel", "start failed err=%v log=%s", err, logPath)
 		fail(fmt.Sprintf("隧道启动失败: %v", err))
 		fail("检查 VPN 和 Clash 是否在运行")
 		if logFile != nil {
@@ -408,39 +543,44 @@ func ensureTunnel() {
 		logFile.Close()
 	}
 
-	// Poll until tunnel process appears (max 10s)
-	deadline := time.Now().Add(10 * time.Second)
+	// Poll until the desired tunnel is visible. autossh can take a few extra
+	// seconds to re-fork after replacing a stale connection.
+	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		if tunnelPID() > 0 {
-			ok("隧道已建立")
+		desiredPIDs, conflictingPIDs := tunnelState()
+		if len(desiredPIDs) == 1 && len(conflictingPIDs) == 0 {
+			debugLogf("tunnel", "ready pid=%d", desiredPIDs[0])
+			ok(fmt.Sprintf("隧道已建立 (pid=%d)", desiredPIDs[0]))
 			return
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+	debugLogf("tunnel", "start timed out log=%s", logPath)
 	fail("隧道启动超时")
 	fail(fmt.Sprintf("日志: %s", logPath))
 	os.Exit(1)
 }
 
 func stopTunnel() {
-	pid := tunnelPID()
-	if pid == 0 {
+	pids := tunnelPIDs()
+	if len(pids) == 0 {
 		warn("隧道未运行")
 		return
 	}
-	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
-		warn(fmt.Sprintf("进程 %d 已不存在", pid))
-		return
-	}
-	// 等待进程退出
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := syscall.Kill(pid, 0); err != nil {
-			break
+	for _, pid := range pids {
+		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+			warn(fmt.Sprintf("进程 %d 已不存在", pid))
+			continue
 		}
-		time.Sleep(200 * time.Millisecond)
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if err := syscall.Kill(pid, 0); err != nil {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
 	}
-	ok(fmt.Sprintf("隧道已关闭 (pid=%d)", pid))
+	ok(fmt.Sprintf("隧道已关闭 (%d 个进程)", len(pids)))
 }
 
 // ── SOCKS proxy ──
@@ -764,17 +904,21 @@ func vpnTunnelUp() bool {
 	return err == nil
 }
 
-func vpnIsUp() bool {
-	// Expensive check: TCP connect to SuperPod :22. Use sparingly.
-	if !vpnTunnelUp() {
-		return false
-	}
-	conn, err := net.DialTimeout("tcp", envOr("SUPERPOD_HOST", "superpod.ust.hk")+":22", 5*time.Second)
+func superpodReachable(timeout time.Duration) bool {
+	conn, err := net.DialTimeout("tcp", envOr("SUPERPOD_HOST", "superpod.ust.hk")+":22", timeout)
 	if err != nil {
 		return false
 	}
 	conn.Close()
 	return true
+}
+
+func vpnIsUp() bool {
+	// Expensive check: TCP connect to SuperPod :22. Use sparingly.
+	if !vpnTunnelUp() {
+		return false
+	}
+	return superpodReachable(5 * time.Second)
 }
 
 func cmdVpnStart() {
@@ -1134,6 +1278,33 @@ func cmdVpnLog() {
 	cmd.Run()
 }
 
+func cmdProxyLog() {
+	debugLogf("proxy-log", "tail remote proxy/relay logs")
+	if err := sshInteractive(`mkdir -p ~/.local/share/spod && touch ~/.local/share/spod/proxy.log ~/.local/share/spod/relay.log && tail -n 80 -f ~/.local/share/spod/proxy.log ~/.local/share/spod/relay.log`); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			os.Exit(exitErr.ExitCode())
+		}
+		fail(fmt.Sprintf("查看远端代理日志失败: %v", err))
+		os.Exit(1)
+	}
+}
+
+func cmdDebugLog() {
+	f, err := os.OpenFile(spodDebugLogPath, os.O_CREATE, 0600)
+	if err == nil {
+		f.Close()
+	}
+	info(fmt.Sprintf("本地调试日志: %s", spodDebugLogPath))
+	cmd := exec.Command("tail", "-f", "-n", "80", spodDebugLogPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fail(fmt.Sprintf("查看本地调试日志失败: %v", err))
+		os.Exit(1)
+	}
+}
+
 // ── Sync ──
 
 const spodSyncTag = "spod-sync" // marker for pkill
@@ -1375,96 +1546,142 @@ func ensureTmuxConf() {
 }
 
 func ensureTmuxConfAndProxy() {
-	// Combine tmux conf + proxy config into a single SSH call to reduce connections.
-	beginMarker := "# spod-proxy-begin"
-	endMarker := "# spod-proxy-end"
-	proxyURL := fmt.Sprintf("http://127.0.0.1:%s", relayPort)
-
-	script := fmt.Sprintf(
-		`grep -q 'set -g mouse on' ~/.tmux.conf 2>/dev/null || echo 'set -g mouse on' >> ~/.tmux.conf
-sed -i '/# spod-proxy/,/# spod-proxy-end/d; /# spod-proxy/d; /^export [hH][tT][tT][pP][sS]*_[pP][rR][oO][xX][yY]=.*127\.0\.0\.1/d; /^export [nN][oO]_[pP][rR][oO][xX][yY]=/d; /^_spod_proxy=/d; /^claude()/d; /^codex()/d; /^unset .*_proxy.*spod/d' ~/.bashrc 2>/dev/null
-cat >> ~/.bashrc << 'SPOD_EOF'
-
-%s
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null # spod: clear stale proxy
-_spod_proxy="%s"
-claude() { http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy" command claude "$@"; }
-codex() { http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy" command codex "$@"; }
-%s
-SPOD_EOF`,
-		beginMarker, proxyURL, endMarker,
-	)
-	if _, err := ssh(script); err != nil {
-		warn("远程配置写入失败（将在连接后重试）")
-	}
+	// Compatibility shim: keep one entry point for the remote shell setup while
+	// delegating proxy installation to the newer self-healing wrapper logic.
+	ensureTmuxConf()
+	ensureRemoteProxy()
 }
 
 // relayScript is a TCP relay proxy with retry, deployed to SuperPod.
 // It sits between claude/codex and the SSH tunnel, absorbing short outages
 // by retrying upstream connections instead of immediately failing.
 const relayScript = `#!/usr/bin/env python3
-import socket,threading,time,sys,signal,os
+import itertools, os, signal, socket, sys, threading, time
 UP_PORT=int(sys.argv[1]) if len(sys.argv)>1 else 17897
 LISTEN=int(sys.argv[2]) if len(sys.argv)>2 else UP_PORT+1
-RETRY_SEC=900; LOG=len(sys.argv)>3 and sys.argv[3]=="--log"
-def relay(s,d):
+RETRY_SEC=900
+LOG=len(sys.argv)>3 and sys.argv[3]=="--log"
+COUNTER=itertools.count(1)
+
+def log(msg):
+    if LOG:
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
+
+def close_quiet(sock):
+    try:
+        sock.close()
+    except Exception:
+        pass
+
+def relay(src, dst, cid, direction, totals):
+    total=0
     try:
         while True:
-            b=s.recv(65536)
-            if not b:break
-            d.sendall(b)
-    except:pass
+            b=src.recv(65536)
+            if not b:
+                log(f"[relay {cid}] {direction} eof bytes={total}")
+                break
+            total += len(b)
+            dst.sendall(b)
+    except Exception as e:
+        log(f"[relay {cid}] {direction} error bytes={total} err={e!r}")
     finally:
-        try:s.close()
-        except:pass
-        try:d.close()
-        except:pass
-def handle(c):
-    end=time.time()+RETRY_SEC;n=0;delay=3
+        totals[direction]=total
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except Exception:
+            pass
+
+def handle(c, peer):
+    cid=next(COUNTER)
+    totals={}
+    log(f"[relay {cid}] accept peer={peer[0]}:{peer[1]} listen={LISTEN} upstream={UP_PORT}")
+    end=time.time()+RETRY_SEC
+    n=0
+    delay=3
+    u=None
     while time.time()<end:
         try:
-            u=socket.create_connection(("127.0.0.1",UP_PORT),timeout=3);break
-        except:
-            n+=1;time.sleep(delay);delay=min(delay*2,30)
-    else:
-        if LOG:print(f"[relay] tunnel down {RETRY_SEC}s, drop",flush=True)
-        c.close();return
-    if n and LOG:print(f"[relay] recovered after {int(time.time()-end+RETRY_SEC)}s ({n} retries)",flush=True)
-    a=threading.Thread(target=relay,args=(c,u),daemon=True)
-    b=threading.Thread(target=relay,args=(u,c),daemon=True)
-    a.start();b.start();a.join();b.join()
-signal.signal(signal.SIGTERM,lambda*_:sys.exit(0))
+            u=socket.create_connection(("127.0.0.1",UP_PORT),timeout=3)
+            u.settimeout(None)
+            c.settimeout(None)
+            break
+        except Exception as e:
+            n+=1
+            log(f"[relay {cid}] upstream connect failed attempt={n} delay={delay}s err={e!r}")
+            time.sleep(delay)
+            delay=min(delay*2,30)
+    if u is None:
+        log(f"[relay {cid}] drop after {n} upstream retries over {RETRY_SEC}s")
+        close_quiet(c)
+        return
+    if n:
+        log(f"[relay {cid}] upstream recovered after retries={n}")
+    started=time.time()
+    a=threading.Thread(target=relay,args=(c,u,cid,"client->upstream",totals),daemon=True)
+    b=threading.Thread(target=relay,args=(u,c,cid,"upstream->client",totals),daemon=True)
+    a.start()
+    b.start()
+    a.join()
+    b.join()
+    log(f"[relay {cid}] close elapsed={time.time()-started:.1f}s up_bytes={totals.get('client->upstream',0)} down_bytes={totals.get('upstream->client',0)}")
+    close_quiet(c)
+    close_quiet(u)
+
+def on_term(*_):
+    log("[relay] received SIGTERM")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM,on_term)
+os.makedirs(os.path.expanduser("~/.local/share/spod"), exist_ok=True)
 srv=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
 srv.bind(("127.0.0.1",LISTEN));srv.listen(64)
-if LOG:print(f"[relay] 127.0.0.1:{LISTEN} -> 127.0.0.1:{UP_PORT}",flush=True)
+log(f"[relay] listening 127.0.0.1:{LISTEN} -> 127.0.0.1:{UP_PORT}")
 # Write PID file
 with open(os.path.expanduser(f"~/.local/share/spod-relay.pid"),"w") as f:f.write(str(os.getpid()))
 while True:
-    c,_=srv.accept()
-    threading.Thread(target=handle,args=(c,),daemon=True).start()
+    c,peer=srv.accept()
+    threading.Thread(target=handle,args=(c,peer),daemon=True).start()
 `
 
 func ensureRelay() {
 	// Deploy and start the TCP relay on SuperPod.
-	// Always writes the latest script; restarts only if script changed or not running.
+	// Always refreshes the relay script on disk, but only restarts the relay
+	// when the listening port is actually down. This avoids killing a healthy
+	// relay during a transient SSH failure.
+	debugLogf("relay", "ensure start tunnel_port=%s relay_port=%s host=%s", tunnelPort, relayPort, host)
 	script := fmt.Sprintf(
-		`mkdir -p ~/.local/bin ~/.local/share
-NEW_SCRIPT=$(cat << 'RELAY_SCRIPT'
+		`mkdir -p ~/.local/bin ~/.local/share/spod
+LOCK=~/.local/share/spod/relay.lock
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCK"
+    flock -x 9
+fi
+TMP=$(mktemp ~/.local/bin/spod-relay.py.XXXXXX)
+cat > "$TMP" << 'RELAY_SCRIPT'
 %s
 RELAY_SCRIPT
-)
-OLD_SCRIPT=""
-[ -f ~/.local/bin/spod-relay.py ] && OLD_SCRIPT=$(cat ~/.local/bin/spod-relay.py)
-if [ "$NEW_SCRIPT" = "$OLD_SCRIPT" ] && pgrep -f "spod-relay\\.py %s %s" >/dev/null 2>&1; then
+chmod +x "$TMP"
+mv "$TMP" ~/.local/bin/spod-relay.py
+relay_up() { (echo > /dev/tcp/127.0.0.1/%s) >/dev/null 2>&1; }
+if relay_up; then
     echo "running"
 else
-    # Kill old relay if running
-    pkill -f "spod-relay\\.py" 2>/dev/null; sleep 0.3
-    echo "$NEW_SCRIPT" > ~/.local/bin/spod-relay.py
-    chmod +x ~/.local/bin/spod-relay.py
-    nohup python3 ~/.local/bin/spod-relay.py %s %s --log > /tmp/spod-relay.log 2>&1 &
-    sleep 0.5
+    if pgrep -f "spod-relay\\.py %s %s" >/dev/null 2>&1; then
+        pkill -f "spod-relay\\.py %s %s" >/dev/null 2>&1 || true
+        sleep 0.3
+    fi
+    nohup python3 ~/.local/bin/spod-relay.py %s %s --log >> ~/.local/share/spod/relay.log 2>&1 &
+    i=0
+    while [ "$i" -lt 20 ]; do
+        if relay_up; then
+            echo "started"
+            exit 0
+        fi
+        i=$((i + 1))
+        sleep 0.25
+    done
     if pgrep -f "spod-relay\\.py %s %s" >/dev/null 2>&1; then
         echo "started"
     else
@@ -1472,22 +1689,26 @@ else
     fi
 fi`,
 		relayScript,
+		relayPort,
+		tunnelPort, relayPort,
 		tunnelPort, relayPort,
 		tunnelPort, relayPort,
 		tunnelPort, relayPort,
 	)
 	out, err := ssh(script)
 	if err != nil {
+		debugLogf("relay", "ensure failed err=%v", err)
 		warn(fmt.Sprintf("Relay 部署失败: %v", err))
 		return
 	}
+	debugLogf("relay", "ensure result=%s", strings.TrimSpace(out))
 	switch strings.TrimSpace(out) {
 	case "running":
 		// silent — already running
 	case "started":
 		ok(fmt.Sprintf("Relay 已启动 (:%s → :%s，隧道断开时自动等待重连)", relayPort, tunnelPort))
 	case "failed":
-		warn("Relay 启动失败，查看日志: /tmp/spod-relay.log")
+		warn("Relay 启动失败，查看日志: ~/.local/share/spod/relay.log")
 	}
 }
 
@@ -1495,31 +1716,168 @@ func ensureRemoteProxy() {
 	// Set up shell wrapper functions for claude/codex so ONLY their processes
 	// get proxy env vars. No global http_proxy — git/pip/npm etc. go direct.
 	// Points to the relay port (not tunnel directly) for outage resilience.
+	// The wrapper self-heals: if the relay died after a login-node restart,
+	// it will try to restart it from ~/.local/bin/spod-relay.py and fall back
+	// to direct network if the relay is still unavailable.
 	beginMarker := "# spod-proxy-begin"
 	endMarker := "# spod-proxy-end"
 	proxyURL := fmt.Sprintf("http://127.0.0.1:%s", relayPort)
+	debugLogf("proxy", "ensure start proxy=%s upstream=%s relay=%s", proxyURL, tunnelPort, relayPort)
 
 	// Remove ALL old proxy config: marker blocks, bare export lines, and _spod_proxy var.
 	script := fmt.Sprintf(
-		`sed -i '/# spod-proxy/,/# spod-proxy-end/d; /# spod-proxy/d; /^export [hH][tT][tT][pP][sS]*_[pP][rR][oO][xX][yY]=.*127\.0\.0\.1/d; /^export [nN][oO]_[pP][rR][oO][xX][yY]=/d; /^_spod_proxy=/d; /^claude()/d; /^codex()/d; /^unset .*_proxy.*spod/d' ~/.bashrc 2>/dev/null
+		`mkdir -p ~/.local/share/spod
+printf '%%s [install] refresh wrapper upstream=%%s relay=%%s proxy=%%s\n' "$(date '+%%F %%T')" "%s" "%s" "%s" >> ~/.local/share/spod/proxy.log
+sed -i '/# spod-proxy/,/# spod-proxy-end/d; /# spod-proxy/d; /^export [hH][tT][tT][pP][sS]*_[pP][rR][oO][xX][yY]=.*127\.0\.0\.1/d; /^export [nN][oO]_[pP][rR][oO][xX][yY]=/d; /^_spod_proxy=/d; /^claude()/d; /^codex()/d; /^unset .*_proxy.*spod/d' ~/.bashrc 2>/dev/null
 cat >> ~/.bashrc << 'SPOD_EOF'
 
 %s
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null # spod: clear stale proxy
 _spod_proxy="%s"
-claude() { http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy" command claude "$@"; }
-codex() { http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy" command codex "$@"; }
+_spod_upstream_port="%s"
+_spod_relay_port="%s"
+_spod_relay="$HOME/.local/bin/spod-relay.py"
+_spod_log_dir="$HOME/.local/share/spod"
+_spod_proxy_log="$_spod_log_dir/proxy.log"
+_spod_relay_log="$_spod_log_dir/relay.log"
+_spod_log() {
+    local tag="$1"
+    shift
+    mkdir -p "$_spod_log_dir" 2>/dev/null
+    printf '%%s [%%s] %%s\n' "$(date '+%%F %%T')" "$tag" "$*" >> "$_spod_proxy_log"
+}
+_spod_prepend_path() {
+    local dir="$1"
+    [ -d "$dir" ] || return 0
+    case ":$PATH:" in
+        *":$dir:"*) ;;
+        *) PATH="$dir:$PATH" ;;
+    esac
+}
+_spod_prepend_path "$HOME/.local/bin"
+_spod_prepend_path "$HOME/.conda/envs/claude/bin"
+_spod_flag_summary() {
+    local out="" arg seen=0
+    for arg in "$@"; do
+        case "$arg" in
+            --*|-*)
+                out="$out $arg"
+                seen=$((seen + 1))
+                [ "$seen" -ge 8 ] && break
+                ;;
+        esac
+    done
+    if [ -n "$out" ]; then
+        printf '%%s' "${out# }"
+    else
+        printf 'none'
+    fi
+}
+_spod_proxy_up() { (echo > /dev/tcp/127.0.0.1/%s) >/dev/null 2>&1; }
+_spod_resolve_tool() {
+    local tool="$1"
+    local candidate=""
+    case "$tool" in
+        codex)
+            for candidate in \
+                "$HOME/.conda/envs/claude/bin/codex" \
+                "$HOME/.local/bin/codex"
+            do
+                [ -x "$candidate" ] && { printf '%%s' "$candidate"; return 0; }
+            done
+            ;;
+        claude)
+            for candidate in \
+                "$HOME/.conda/envs/claude/bin/claude" \
+                "$HOME/.local/bin/claude"
+            do
+                [ -x "$candidate" ] && { printf '%%s' "$candidate"; return 0; }
+            done
+            ;;
+    esac
+    candidate=$(type -P "$tool" 2>/dev/null || true)
+    [ -n "$candidate" ] && printf '%%s' "$candidate"
+}
+_spod_ensure_proxy() {
+    local tty_label
+    tty_label=$(tty 2>/dev/null || true)
+    [ -n "$tty_label" ] || tty_label=none
+    _spod_log proxy "ensure start shell=$$ tty=$tty_label"
+    if _spod_proxy_up; then
+        _spod_log proxy "relay already up port=$_spod_relay_port"
+        return 0
+    fi
+    if [ -x "$_spod_relay" ] && command -v python3 >/dev/null 2>&1; then
+        if pgrep -f "spod-relay\.py $_spod_upstream_port $_spod_relay_port" >/dev/null 2>&1; then
+            _spod_log proxy "stale relay detected; restarting existing process"
+            pkill -f "spod-relay\.py $_spod_upstream_port $_spod_relay_port" >/dev/null 2>&1
+            sleep 0.2
+        else
+            _spod_log proxy "relay down; starting new process"
+        fi
+        nohup python3 "$_spod_relay" "$_spod_upstream_port" "$_spod_relay_port" --log >> "$_spod_relay_log" 2>&1 &
+        local i=0
+        while [ "$i" -lt 10 ]; do
+            if _spod_proxy_up; then
+                _spod_log proxy "relay became ready wait_index=$i"
+                return 0
+            fi
+            i=$((i + 1))
+            sleep 0.5
+        done
+    fi
+    _spod_log proxy "relay unavailable; falling back to direct network"
+    return 1
+}
+_spod_run_tool() {
+    local tool="$1"
+    shift
+    local flags
+    local resolved
+    flags="$(_spod_flag_summary "$@")"
+    _spod_log "$tool" "invoke shell=$$ argc=$# flags=$flags"
+    resolved="$(_spod_resolve_tool "$tool")"
+    if [ -z "$resolved" ]; then
+        _spod_log "$tool" "binary missing"
+        printf '%%s: command not found\n' "$tool" >&2
+        return 127
+    fi
+    _spod_prepend_path "$(dirname "$resolved")"
+    if _spod_ensure_proxy; then
+        _spod_log "$tool" "mode=proxy proxy=$_spod_proxy bin=$resolved"
+        http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy" "$resolved" "$@"
+        local rc=$?
+        _spod_log "$tool" "exit=$rc mode=proxy"
+        return $rc
+    fi
+    _spod_log "$tool" "mode=direct bin=$resolved"
+    "$resolved" "$@"
+    local rc=$?
+    _spod_log "$tool" "exit=$rc mode=direct"
+    return $rc
+}
+claude() {
+    _spod_run_tool claude "$@"
+}
+codex() {
+    _spod_run_tool codex "$@"
+}
+_spod_ensure_proxy >/dev/null 2>&1 || true
 %s
 SPOD_EOF`,
-		beginMarker, proxyURL, endMarker,
+		tunnelPort, relayPort, proxyURL,
+		beginMarker, proxyURL, tunnelPort, relayPort, relayPort, endMarker,
 	)
 	if _, err := ssh(script); err != nil {
+		debugLogf("proxy", "ensure failed err=%v", err)
 		warn("代理配置写入失败（将在连接后重试）")
+		return
 	}
+	debugLogf("proxy", "ensure finished")
 }
 
 func ensureRemoteSetup() {
-	// Minimal SSH calls: tmux+proxy combined (1 call) + relay (1 call)
+	// Keep remote shell setup centralized so attachOrCreate has one prep entry.
 	ensureTmuxConfAndProxy()
 	ensureRelay()
 }
@@ -1667,6 +2025,8 @@ func cmdHelp() {
 		{"spod vpn restart", "重启 VPN"},
 		{"spod vpn status", "查看 VPN + SuperPod 状态"},
 		{"spod vpn log", "实时查看 VPN 日志"},
+		{"spod proxy log", "实时查看远端 codex/claude 代理日志"},
+		{"spod debug log", "实时查看本地 spod 调试日志"},
 		{"spod tunnel", "启动 / 检查 SSH 隧道"},
 		{"spod tunnel stop", "关闭隧道"},
 		{"spod socks", "启动 SOCKS5 代理（Windows 可用）"},
@@ -1714,6 +2074,31 @@ func main() {
 			cmdVpnWatch()
 		default:
 			cmdVpnStart()
+		}
+	case "proxy":
+		sub := ""
+		if len(args) > 1 {
+			sub = args[1]
+		}
+		switch sub {
+		case "log":
+			ensureTunnel()
+			cmdProxyLog()
+		default:
+			fail("用法: spod proxy log")
+			os.Exit(1)
+		}
+	case "debug":
+		sub := ""
+		if len(args) > 1 {
+			sub = args[1]
+		}
+		switch sub {
+		case "log":
+			cmdDebugLog()
+		default:
+			fail("用法: spod debug log")
+			os.Exit(1)
 		}
 	case "tunnel":
 		if len(args) > 1 && args[1] == "stop" {
