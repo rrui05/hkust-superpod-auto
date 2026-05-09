@@ -19,12 +19,15 @@ import (
 
 var (
 	host       = envOr("SPOD_SSH_HOST", "superpod")
-	tunnelPort = envOr("TUNNEL_PORT", "17897")
+	tunnelPort = os.Getenv("TUNNEL_PORT") // empty → computed from remote UID in ensurePorts()
 	localPort  = envOr("CLASH_PORT", "7897")
 	socksPort  = envOr("SOCKS_PORT", "1080")
-	relayPort  = "" // computed in init(): tunnelPort + 1
+	relayPort  = os.Getenv("SPOD_RELAY_PORT") // empty → computed from remote UID in ensurePorts()
 	prefix     = "spod"
 	vpnScript  = "" // resolved in init()
+
+	remoteUID int // lazily fetched via ssh("id -u"), cached on disk
+	portsMu   sync.Mutex
 )
 
 func envOr(key, fallback string) string {
@@ -35,10 +38,6 @@ func envOr(key, fallback string) string {
 }
 
 func init() {
-	// Default relay port before .env is loaded
-	tp, _ := strconv.Atoi(tunnelPort)
-	relayPort = strconv.Itoa(tp + 1)
-
 	// Load .env from project root (walk up from executable or cwd)
 	for _, base := range []string{os.Getenv("SPOD_ENV_FILE"), findDotenv()} {
 		if base == "" {
@@ -75,11 +74,10 @@ func init() {
 		}
 		// Re-read vars after loading .env
 		host = envOr("SPOD_SSH_HOST", "superpod")
-		tunnelPort = envOr("TUNNEL_PORT", "17897")
+		tunnelPort = os.Getenv("TUNNEL_PORT")
 		localPort = envOr("CLASH_PORT", "7897")
 		socksPort = envOr("SOCKS_PORT", "1080")
-		tp, _ := strconv.Atoi(tunnelPort)
-		relayPort = strconv.Itoa(tp + 1)
+		relayPort = os.Getenv("SPOD_RELAY_PORT")
 		break
 	}
 
@@ -129,7 +127,7 @@ func ensureSSHConfig() {
     HostName %s
     User %s
 
-    # 连接复用：减少反复 SSH 握手触发服务端限流
+
     ControlMaster auto
     ControlPath /tmp/spod-ssh-%%r@%%h:%%p
     ControlPersist 300
@@ -143,7 +141,7 @@ func ensureSSHConfig() {
 	existing, _ := os.ReadFile(configPath)
 	content := string(existing)
 
-	// Check if superpod block exists
+	// Check if superpod block exists and is up to date
 	if strings.Contains(content, "Host superpod") {
 		if strings.Contains(content, "HostName "+sshHost) &&
 			strings.Contains(content, "User "+sshUser) &&
@@ -151,6 +149,7 @@ func ensureSSHConfig() {
 			return // already correct
 		}
 		// Config mismatch — replace the whole superpod block
+
 		// Find block boundaries (from "Host superpod" to next "Host " or EOF)
 		lines := strings.Split(content, "\n")
 		var result []string
@@ -254,8 +253,19 @@ func isSSHConnErr(err error) bool {
 func ssh(args ...string) (string, error) {
 	const maxRetries = 3
 	delays := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
+
+	// For multi-line scripts, use stdin instead of command argument.
+	// SSH's remote bash -c has issues with heredocs passed as arguments.
+	useStdin := len(args) == 1 && strings.Contains(args[0], "\n")
+
 	for attempt := 0; ; attempt++ {
-		cmd := exec.Command("ssh", append([]string{"-o", "ConnectTimeout=5", host}, args...)...)
+		var cmd *exec.Cmd
+		if useStdin {
+			cmd = exec.Command("ssh", "-o", "ConnectTimeout=5", host, "bash -s")
+			cmd.Stdin = strings.NewReader(args[0])
+		} else {
+			cmd = exec.Command("ssh", append([]string{"-o", "ConnectTimeout=5", host}, args...)...)
+		}
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
@@ -295,21 +305,25 @@ func sshInteractive(args ...string) error {
 
 // ── Tunnel ──
 
-// tunnelPID finds the autossh process managing our tunnel.
-// Verifies via /proc/PID/cmdline to avoid pgrep self-matches and
-// child ssh process false positives.
-func tunnelPID() int {
-	cmd := exec.Command("pgrep", "-f", "autossh.*-R "+tunnelPort+":127.0.0.1:"+localPort)
+// tunnelPIDAndPort returns (pid, remote port) of the running autossh that
+// reverse-forwards our localPort, or (0, "") if none. Matches any remote
+// port — callers decide whether it's the expected one. Regex is anchored
+// to the exact -R forward targeting 127.0.0.1:<localPort> so an autossh
+// with multiple -R flags cannot yield a sibling forward's port.
+func tunnelPIDAndPort() (int, string) {
+	// Word boundary after the port prevents false match on a longer port
+	// that shares our port as prefix (e.g. 78970 vs 7897).
+	quotedLocal := regexp.QuoteMeta(localPort)
+	pgrepPattern := `autossh.*-R [0-9]+:127\.0\.0\.1:` + quotedLocal + `([^0-9]|$)`
+	procRE := regexp.MustCompile(`-R (\d+):127\.0\.0\.1:` + quotedLocal + `(?:[^0-9]|$)`)
+
+	cmd := exec.Command("pgrep", "-f", pgrepPattern)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	if err := cmd.Run(); err != nil {
-		return 0
+		return 0, ""
 	}
-	out := strings.TrimSpace(stdout.String())
-	if out == "" {
-		return 0
-	}
-	for _, line := range strings.Split(out, "\n") {
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
 		pid, err := strconv.Atoi(strings.TrimSpace(line))
 		if err != nil || pid <= 0 {
 			continue
@@ -318,11 +332,123 @@ func tunnelPID() int {
 		if err != nil {
 			continue // process already gone (pgrep self-match)
 		}
-		if strings.Contains(string(cmdline), "autossh") {
-			return pid
+		// /proc cmdline separates args with NUL; normalize for regex.
+		normalized := strings.ReplaceAll(string(cmdline), "\x00", " ")
+		if !strings.Contains(normalized, "autossh") {
+			continue
+		}
+		m := procRE.FindStringSubmatch(normalized)
+		if len(m) < 2 {
+			continue
+		}
+		return pid, m[1]
+	}
+	return 0, ""
+}
+
+func tunnelPID() int {
+	pid, _ := tunnelPIDAndPort()
+	return pid
+}
+
+// waitForExit polls up to maxWait for pid to exit. Returns true if gone.
+func waitForExit(pid int, maxWait time.Duration) bool {
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
+}
+
+// killTunnelPID sends SIGTERM, waits up to 5s, then SIGKILL if still alive.
+func killTunnelPID(pid int) {
+	syscall.Kill(pid, syscall.SIGTERM)
+	if !waitForExit(pid, 5*time.Second) {
+		syscall.Kill(pid, syscall.SIGKILL)
+		waitForExit(pid, 2*time.Second)
+	}
+}
+
+// uidCachePath returns a per-identity cache path keyed by SSH user@host.
+// Keying by identity prevents a stale cached UID after the user switches
+// SUPERPOD_USER or SUPERPOD_HOST to a different account.
+func uidCachePath() string {
+	cacheDir, _ := os.UserCacheDir()
+	if cacheDir == "" {
+		return ""
+	}
+	sshUser := envOr("SUPERPOD_USER", "")
+	sshHost := envOr("SUPERPOD_HOST", host)
+	key := sshHost
+	if sshUser != "" {
+		key = sshUser + "@" + sshHost
+	}
+	safe := regexp.MustCompile(`[^a-zA-Z0-9._@-]`).ReplaceAllString(key, "_")
+	return filepath.Join(cacheDir, "spod", "remote-uid-"+safe)
+}
+
+// getRemoteUID fetches the SuperPod UID via `ssh id -u`, caching the result
+// in memory and on disk to avoid repeated SSH.
+func getRemoteUID() int {
+	portsMu.Lock()
+	defer portsMu.Unlock()
+	if remoteUID > 0 {
+		return remoteUID
+	}
+	cachePath := uidCachePath()
+	if cachePath != "" {
+		if data, err := os.ReadFile(cachePath); err == nil {
+			if uid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && uid > 0 {
+				remoteUID = uid
+				return uid
+			}
 		}
 	}
-	return 0
+	out, err := ssh("id -u")
+	if err != nil {
+		return 0
+	}
+	uid, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil || uid <= 0 {
+		return 0
+	}
+	remoteUID = uid
+	if cachePath != "" {
+		os.MkdirAll(filepath.Dir(cachePath), 0700)
+		os.WriteFile(cachePath, []byte(strconv.Itoa(uid)), 0600)
+	}
+	return uid
+}
+
+// ensurePorts computes per-user tunnelPort / relayPort from the remote UID.
+// Env vars TUNNEL_PORT and SPOD_RELAY_PORT take precedence if set.
+// Uses separate bases (17000 / 18000) so tunnel and relay ports can never
+// collide across users even if their UIDs share the same %1000 bucket.
+func ensurePorts() {
+	if tunnelPort != "" && relayPort != "" {
+		return
+	}
+	uid := getRemoteUID()
+	if uid == 0 {
+		// UID lookup failed (SSH down); fall back to legacy shared defaults
+		// so single-user setups still work.
+		if tunnelPort == "" {
+			tunnelPort = "17897"
+		}
+		if relayPort == "" {
+			relayPort = "18897"
+		}
+		return
+	}
+	if tunnelPort == "" {
+		tunnelPort = strconv.Itoa(17000 + uid%1000)
+	}
+	if relayPort == "" {
+		relayPort = strconv.Itoa(18000 + uid%1000)
+	}
 }
 
 func tunnelLooksAlive() bool {
@@ -375,7 +501,34 @@ func ensureTunnel() {
 		}()
 	}
 
-	pid := tunnelPID()
+	ensurePorts()
+
+	// Clean up any stale autossh whose -R port doesn't match our expected
+	// tunnelPort. Loops so that multiple stale instances are all reaped,
+	// and re-scans after each kill to confirm the PID is gone before
+	// starting a new autossh (ExitOnForwardFailure=yes is unforgiving if
+	// the old ssh child still holds the remote bind).
+	killed := 0
+	for {
+		pid, runningPort := tunnelPIDAndPort()
+		if pid == 0 || runningPort == tunnelPort {
+			break
+		}
+		warn(fmt.Sprintf("旧隧道端口 %s ≠ 预期 %s，清理 pid=%d", runningPort, tunnelPort, pid))
+		killTunnelPID(pid)
+		killed++
+		if killed >= 5 {
+			warn("清理旧隧道超过 5 次，放弃")
+			break
+		}
+	}
+	if killed > 0 {
+		// Give remote sshd a moment to release the -R port binding before
+		// the new autossh tries to rebind.
+		time.Sleep(2 * time.Second)
+	}
+
+	pid, _ := tunnelPIDAndPort()
 	if pid > 0 {
 		if tunnelLooksAlive() {
 			ok(fmt.Sprintf("隧道运行中 (pid=%d)", pid))
@@ -401,6 +554,7 @@ func ensureTunnel() {
 		"-o", "TCPKeepAlive=yes",
 		"-o", "ControlMaster=no",
 		"-o", "ControlPath=none",
+
 		"-R", fmt.Sprintf("%s:127.0.0.1:%s", tunnelPort, localPort),
 		host,
 	)
@@ -519,6 +673,7 @@ func ensureSocks() {
 		"-o", "ServerAliveCountMax=4",
 		"-o", "ExitOnForwardFailure=yes",
 		"-o", "TCPKeepAlive=yes",
+		"-o", "ControlMaster=no",
 		"-D", fmt.Sprintf("0.0.0.0:%s", socksPort),
 		host,
 	)
@@ -1043,20 +1198,38 @@ func cmdVpnWatch() {
 	}
 
 	// Background connectivity probe — tun0 check is cheap (no network traffic).
-	// TCP :22 check only once per 60s to avoid hammering SuperPod.
+	// TCP :22 probe uses exponential backoff in BOTH directions:
+	//   success: 30s → 60s → ... → 5min  (slow down when stable)
+	//   failure: 30s → 60s → ... → 5min  (avoid hammering overloaded login service)
+	// Resets to 30s only when tun0 transitions from down→up (fresh connection).
 	var isUp bool
 	var lastTCPCheck time.Time
+	var wasTunnelUp bool
+	var tcpInterval = 30 * time.Second
+	const tcpIntervalMax = 5 * time.Minute
 	go func() {
 		for {
 			tunnelUp := vpnTunnelUp()
 			up := false
-			if tunnelUp && time.Since(lastTCPCheck) >= 5*time.Minute {
+			justConnected := tunnelUp && !wasTunnelUp
+			if justConnected {
+				// Fresh VPN connection — reset to fast probe for quick feedback
+				tcpInterval = 30 * time.Second
+			}
+			if tunnelUp && (justConnected || time.Since(lastTCPCheck) >= tcpInterval) {
 				up = vpnIsUp()
 				lastTCPCheck = time.Now()
+				// Exponential backoff regardless of result — both success and failure
+				// back off to reduce SSH connection pressure on SuperPod login nodes
+				tcpInterval = min(tcpInterval*2, tcpIntervalMax)
 			} else if tunnelUp {
 				mu.Lock()
-				up = isUp // keep last known TCP state between checks
+				up = isUp
 				mu.Unlock()
+			}
+			wasTunnelUp = tunnelUp
+			if !tunnelUp {
+				tcpInterval = 30 * time.Second
 			}
 			mu.Lock()
 			isUp = up
@@ -1303,12 +1476,20 @@ func listRemoteSessions() ([]session, error) {
 	return sessions, nil
 }
 
+var cachedSessions []session
+var sessionsCached bool
+
 func mustListSessions() []session {
+	if sessionsCached {
+		return cachedSessions
+	}
 	sessions, err := listRemoteSessions()
 	if err != nil {
 		fail(err.Error())
 		os.Exit(1)
 	}
+	cachedSessions = sessions
+	sessionsCached = true
 	return sessions
 }
 
@@ -1357,9 +1538,39 @@ func printSessions(sessions []session) {
 	fmt.Fprintln(os.Stderr)
 }
 
-func ensureTmuxConf() {
-	// Ensure mouse mode is enabled in remote ~/.tmux.conf
-	ssh(`grep -q 'set -g mouse on' ~/.tmux.conf 2>/dev/null || echo 'set -g mouse on' >> ~/.tmux.conf`)
+// ensureTmuxConfAndProxy writes the claude/codex proxy wrappers into ~/.bashrc.
+// Routes through relayPort when ensureRelay() confirmed the relay is up,
+// so short tunnel outages are absorbed via 900s upstream retry. Falls
+// back to direct tunnelPort if relay setup failed. Set SPOD_NO_RELAY=1
+// to force bypass (emergency override).
+func ensureTmuxConfAndProxy(useRelay bool) {
+	proxyPort := tunnelPort
+	if useRelay && relayPort != "" && os.Getenv("SPOD_NO_RELAY") != "1" {
+		proxyPort = relayPort
+	}
+	if proxyPort == "" {
+		warn("代理端口未就绪，跳过 bashrc 写入")
+		return
+	}
+	beginMarker := "# spod-proxy-begin"
+	endMarker := "# spod-proxy-end"
+	script := fmt.Sprintf(
+		`grep -q 'set -g mouse on' ~/.tmux.conf 2>/dev/null || echo 'set -g mouse on' >> ~/.tmux.conf
+sed -i '/# spod-proxy/,/# spod-proxy-end/d; /# spod-proxy/d; /^export [hH][tT][tT][pP][sS]*_[pP][rR][oO][xX][yY]=.*127\.0\.0\.1/d; /^export [nN][oO]_[pP][rR][oO][xX][yY]=/d; /^_spod_proxy=/d; /^_spod_claude_bin=/d; /^_spod_codex_bin=/d; /^claude()/d; /^codex()/d; /^unset .*_proxy.*spod/d' ~/.bashrc 2>/dev/null
+cat >> ~/.bashrc << 'SPOD_EOF'
+
+%s
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null # spod: clear stale proxy
+_spod_proxy="http://127.0.0.1:%s"
+claude() { export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; command claude "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; return $rc; }
+codex() { export http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy"; command codex "$@"; local rc=$?; unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; return $rc; }
+%s
+SPOD_EOF`,
+		beginMarker, proxyPort, endMarker,
+	)
+	if _, err := ssh(script); err != nil {
+		warn("远程配置写入失败（将在连接后重试）")
+	}
 }
 
 func tmuxMouseCmd() string {
@@ -1369,24 +1580,35 @@ func tmuxMouseCmd() string {
 // relayScript is a TCP relay proxy with retry, deployed to SuperPod.
 // It sits between claude/codex and the SSH tunnel, absorbing short outages
 // by retrying upstream connections instead of immediately failing.
+// Both this relay and the upstream SSH tunnel bind per-user ports derived
+// from the remote UID (18000+uid%1000 and 17000+uid%1000 respectively) to
+// avoid collisions on shared login nodes.
 const relayScript = `#!/usr/bin/env python3
+# TCP relay with half-close handling + explicit settimeout(None) after
+# connect. socket.create_connection(timeout=N) leaks N as the socket's
+# DEFAULT timeout, so every subsequent recv/send raises TimeoutError
+# after N seconds of idle — that was spuriously shutting down idle
+# keepalive connections 3s after CONNECT and causing UND_ERR_SOCKET
+# in Claude Code (undici pools and reuses idle HTTPS CONNECT tunnels).
 import socket,threading,time,sys,signal,os
 UP_PORT=int(sys.argv[1]) if len(sys.argv)>1 else 17897
 LISTEN=int(sys.argv[2]) if len(sys.argv)>2 else UP_PORT+1
 RETRY_SEC=900; LOG=len(sys.argv)>3 and sys.argv[3]=="--log"
-def relay(s,d):
+def pipe(src,dst):
     try:
         while True:
-            b=s.recv(65536)
-            if not b:break
-            d.sendall(b)
-    except:pass
-    finally:
-        try:s.close()
-        except:pass
-        try:d.close()
+            b=src.recv(65536)
+            if not b:
+                try:dst.shutdown(socket.SHUT_WR)
+                except:pass
+                return
+            dst.sendall(b)
+    except:
+        try:dst.shutdown(socket.SHUT_WR)
         except:pass
 def handle(c):
+    c.settimeout(None)
+    c.setsockopt(socket.SOL_SOCKET,socket.SO_KEEPALIVE,1)
     end=time.time()+RETRY_SEC;n=0;delay=3
     while time.time()<end:
         try:
@@ -1397,24 +1619,38 @@ def handle(c):
         if LOG:print(f"[relay] tunnel down {RETRY_SEC}s, drop",flush=True)
         c.close();return
     if n and LOG:print(f"[relay] recovered after {int(time.time()-end+RETRY_SEC)}s ({n} retries)",flush=True)
-    a=threading.Thread(target=relay,args=(c,u),daemon=True)
-    b=threading.Thread(target=relay,args=(u,c),daemon=True)
+    u.settimeout(None)  # critical: clear the 3s timeout leaked by create_connection
+    u.setsockopt(socket.SOL_SOCKET,socket.SO_KEEPALIVE,1)
+    a=threading.Thread(target=pipe,args=(c,u),daemon=True)
+    b=threading.Thread(target=pipe,args=(u,c),daemon=True)
     a.start();b.start();a.join();b.join()
+    try:c.close()
+    except:pass
+    try:u.close()
+    except:pass
 signal.signal(signal.SIGTERM,lambda*_:sys.exit(0))
 srv=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
 srv.bind(("127.0.0.1",LISTEN));srv.listen(64)
-if LOG:print(f"[relay] 127.0.0.1:{LISTEN} -> 127.0.0.1:{UP_PORT}",flush=True)
-# Write PID file
-with open(os.path.expanduser(f"~/.local/share/spod-relay.pid"),"w") as f:f.write(str(os.getpid()))
+if LOG:print(f"[relay] 127.0.0.1:{LISTEN} -> 127.0.0.1:{UP_PORT} (uid={os.getuid()})",flush=True)
+with open(os.path.expanduser("~/.local/share/spod-relay.pid"),"w") as f:f.write(str(os.getpid()))
 while True:
     c,_=srv.accept()
     threading.Thread(target=handle,args=(c,),daemon=True).start()
 `
 
-func ensureRelay() {
+// ensureRelay deploys and starts spod-relay.py on SuperPod. Returns true iff
+// the relay is confirmed running on relayPort — caller uses this to decide
+// whether the claude/codex proxy should point at the relay or fall back to
+// the tunnel directly.
+func ensureRelay() bool {
+	ensurePorts()
+	if relayPort == "" || tunnelPort == "" {
+		warn("端口未就绪，跳过 relay")
+		return false
+	}
+
 	// Deploy and start the TCP relay on SuperPod.
-	// Always writes the latest script; restarts only if script changed or not running.
 	script := fmt.Sprintf(
 		`mkdir -p ~/.local/bin ~/.local/share
 NEW_SCRIPT=$(cat << 'RELAY_SCRIPT'
@@ -1423,16 +1659,15 @@ RELAY_SCRIPT
 )
 OLD_SCRIPT=""
 [ -f ~/.local/bin/spod-relay.py ] && OLD_SCRIPT=$(cat ~/.local/bin/spod-relay.py)
-if [ "$NEW_SCRIPT" = "$OLD_SCRIPT" ] && pgrep -f "spod-relay\\.py %s %s" >/dev/null 2>&1; then
+if [ "$NEW_SCRIPT" = "$OLD_SCRIPT" ] && pgrep -u $(id -u) -f "spod-relay\\.py %s %s" >/dev/null 2>&1; then
     echo "running"
 else
-    # Kill old relay if running
-    pkill -f "spod-relay\\.py" 2>/dev/null; sleep 0.3
+    pkill -u $(id -u) -f "spod-relay\\.py" 2>/dev/null; sleep 0.3
     echo "$NEW_SCRIPT" > ~/.local/bin/spod-relay.py
     chmod +x ~/.local/bin/spod-relay.py
-    nohup python3 ~/.local/bin/spod-relay.py %s %s --log > /tmp/spod-relay.log 2>&1 &
+    nohup python3 ~/.local/bin/spod-relay.py %s %s --log > /tmp/spod-relay-$(id -u).log 2>&1 &
     sleep 0.5
-    if pgrep -f "spod-relay\\.py %s %s" >/dev/null 2>&1; then
+    if pgrep -u $(id -u) -f "spod-relay\\.py %s %s" >/dev/null 2>&1; then
         echo "started"
     else
         echo "failed"
@@ -1446,44 +1681,103 @@ fi`,
 	out, err := ssh(script)
 	if err != nil {
 		warn(fmt.Sprintf("Relay 部署失败: %v", err))
-		return
+		return false
 	}
 	switch strings.TrimSpace(out) {
 	case "running":
-		// silent — already running
+		return true
 	case "started":
 		ok(fmt.Sprintf("Relay 已启动 (:%s → :%s，隧道断开时自动等待重连)", relayPort, tunnelPort))
+		return true
 	case "failed":
-		warn("Relay 启动失败，查看日志: /tmp/spod-relay.log")
+		warn("Relay 启动失败，查看日志: /tmp/spod-relay-$(id -u).log")
+		return false
+	default:
+		warn(fmt.Sprintf("Relay 状态未知: %q", strings.TrimSpace(out)))
+		return false
 	}
 }
 
-func ensureRemoteProxy() {
-	// Set up shell wrapper functions for claude/codex so ONLY their processes
-	// get proxy env vars. No global http_proxy — git/pip/npm etc. go direct.
-	// Points to the relay port (not tunnel directly) for outage resilience.
-	beginMarker := "# spod-proxy-begin"
-	endMarker := "# spod-proxy-end"
-	proxyURL := fmt.Sprintf("http://127.0.0.1:%s", relayPort)
-
-	// Remove ALL old proxy config: marker blocks, bare export lines, and _spod_proxy var.
-	script := fmt.Sprintf(
-		`sed -i '/# spod-proxy/,/# spod-proxy-end/d; /# spod-proxy/d; /^export [hH][tT][tT][pP][sS]*_[pP][rR][oO][xX][yY]=.*127\.0\.0\.1/d; /^export [nN][oO]_[pP][rR][oO][xX][yY]=/d; /^_spod_proxy=/d; /^claude()/d; /^codex()/d; /^unset .*_proxy.*spod/d' ~/.bashrc 2>/dev/null
-cat >> ~/.bashrc << 'SPOD_EOF'
-
-%s
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null # spod: clear stale proxy
-_spod_proxy="%s"
-claude() { http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy" command claude "$@"; }
-codex() { http_proxy="$_spod_proxy" https_proxy="$_spod_proxy" HTTP_PROXY="$_spod_proxy" HTTPS_PROXY="$_spod_proxy" command codex "$@"; }
-%s
-SPOD_EOF`,
-		beginMarker, proxyURL, endMarker,
-	)
-	if _, err := ssh(script); err != nil {
-		warn("代理配置写入失败（将在连接后重试）")
-	}
+func ensureRemoteSetup() {
+	// Relay first (computes per-user ports); proxy config rides the relay
+	// if it came up, otherwise points direct to the tunnel.
+	relayOK := ensureRelay()
+	ensureTmuxConfAndProxy(relayOK)
+	ensureRemoteCLIs()
 }
+
+// ensureRemoteCLIs verifies the claude/codex npm packages on SuperPod still
+// exist (symlink targets are present and executable). Observed 2026-04-29:
+// the @anthropic-ai/claude-code package directory was wiped clean (likely a
+// stale npm install state or a home-quota cleanup), leaving a dangling
+// symlink and `claude: command not found` from inside the wrapper. This
+// silently re-installs broken packages so the user doesn't have to debug.
+// Skip with SPOD_NO_CLI_CHECK=1.
+func ensureRemoteCLIs() {
+	if os.Getenv("SPOD_NO_CLI_CHECK") == "1" {
+		return
+	}
+	probe := `ENV_BIN="$HOME/.conda/envs/claude/bin"
+broken=""
+for name in claude codex; do
+    link="$ENV_BIN/$name"
+    [ -L "$link" ] || [ -e "$link" ] || { broken="$broken $name"; continue; }
+    target=$(readlink -f "$link" 2>/dev/null)
+    if [ -z "$target" ] || [ ! -x "$target" ]; then
+        broken="$broken $name"
+    fi
+done
+echo "BROKEN:${broken# }"
+[ -x "$ENV_BIN/npm" ] && echo "NPM:$ENV_BIN/npm" || echo "NPM:"
+`
+	out, err := ssh(probe)
+	if err != nil {
+		warn("远端 claude/codex 健康检查失败（跳过）")
+		return
+	}
+	var brokenLine, npmPath string
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case strings.HasPrefix(line, "BROKEN:"):
+			brokenLine = strings.TrimSpace(strings.TrimPrefix(line, "BROKEN:"))
+		case strings.HasPrefix(line, "NPM:"):
+			npmPath = strings.TrimSpace(strings.TrimPrefix(line, "NPM:"))
+		}
+	}
+	if brokenLine == "" {
+		return
+	}
+	if npmPath == "" {
+		warn(fmt.Sprintf("远端 %s 损坏（symlink 目标缺失），但 conda env 'claude' 里没找到 npm，无法自动修复", brokenLine))
+		warn("手动修复: ssh superpod 后激活 claude env，运行 npm install -g @anthropic-ai/claude-code @openai/codex")
+		return
+	}
+	pkgs := []string{}
+	for _, name := range strings.Fields(brokenLine) {
+		switch name {
+		case "claude":
+			pkgs = append(pkgs, "@anthropic-ai/claude-code")
+		case "codex":
+			pkgs = append(pkgs, "@openai/codex")
+		}
+	}
+	if len(pkgs) == 0 {
+		return
+	}
+	warn(fmt.Sprintf("远端 %s 损坏，正在重新安装 %s ...", brokenLine, strings.Join(pkgs, " ")))
+	// PATH must include npm's directory so npm's "#!/usr/bin/env node"
+	// shebang resolves the node binary that lives next to it. SSH
+	// non-interactive sessions don't source ~/.bashrc, so without this
+	// the install fails with "/usr/bin/env: 'node': No such file or directory".
+	fixCmd := fmt.Sprintf(`PATH="%s:$PATH" %s install -g %s 2>&1 | tail -3`, filepath.Dir(npmPath), npmPath, strings.Join(pkgs, " "))
+	fixOut, fixErr := ssh(fixCmd)
+	if fixErr != nil {
+		warn(fmt.Sprintf("重装失败: %v\n%s", fixErr, strings.TrimSpace(fixOut)))
+		return
+	}
+	info(fmt.Sprintf("重装完成: %s", strings.TrimSpace(fixOut)))
+}
+
 
 func ensureProxyIfTunnelRunning() {
 	if tunnelPID() == 0 {
@@ -1620,6 +1914,100 @@ func cmdInteractive() {
 	}
 }
 
+func cmdCreds() {
+	ensureVPN()
+	home, _ := os.UserHomeDir()
+	type credFile struct {
+		local  string
+		remote string
+	}
+	files := []credFile{
+		{filepath.Join(home, ".codex", "auth.json"), "~/.codex/auth.json"},
+		{filepath.Join(home, ".codex", "config.toml"), "~/.codex/config.toml"},
+		{filepath.Join(home, ".codex", ".credentials.json"), "~/.codex/.credentials.json"},
+		{filepath.Join(home, ".claude", ".credentials.json"), "~/.claude/.credentials.json"},
+	}
+
+	// Ensure remote dirs exist
+	ssh("mkdir -p ~/.codex ~/.claude")
+
+	synced := 0
+	for _, f := range files {
+		if _, err := os.Stat(f.local); err != nil {
+			continue
+		}
+		cmd := exec.Command("scp", "-o", "ConnectTimeout=5", f.local, host+":"+f.remote)
+		if err := cmd.Run(); err != nil {
+			warn(fmt.Sprintf("%s → 失败: %v", f.remote, err))
+		} else {
+			ok(fmt.Sprintf("%s → %s", filepath.Base(f.local), f.remote))
+			synced++
+		}
+	}
+	if synced == 0 {
+		warn("没有找到本地凭证文件")
+		info("先在本地运行 `codex login` 或 `claude login`")
+	} else {
+		ok(fmt.Sprintf("已同步 %d 个凭证文件到 SuperPod", synced))
+	}
+}
+
+func cmdUptime() {
+	out, err := ssh("hostname; awk '{print int($1)}' /proc/uptime; uptime -s; uptime")
+	if err != nil {
+		fail(fmt.Sprintf("查询失败: %v", err))
+		os.Exit(1)
+	}
+	lines := strings.Split(out, "\n")
+	if len(lines) < 4 {
+		fail("返回格式异常")
+		fmt.Fprintln(os.Stderr, out)
+		os.Exit(1)
+	}
+	hostName := strings.TrimSpace(lines[0])
+	upSec, _ := strconv.Atoi(strings.TrimSpace(lines[1]))
+	bootTime := strings.TrimSpace(lines[2])
+	fullLine := strings.TrimSpace(lines[3])
+
+	load, users := "", ""
+	if idx := strings.Index(fullLine, "load average:"); idx >= 0 {
+		load = strings.TrimSpace(fullLine[idx+len("load average:"):])
+	}
+	if idx := strings.Index(fullLine, " user"); idx >= 0 {
+		parts := strings.Fields(fullLine[:idx])
+		if len(parts) > 0 {
+			users = parts[len(parts)-1]
+		}
+	}
+
+	dur := time.Duration(upSec) * time.Second
+	var upStr string
+	switch {
+	case dur < time.Hour:
+		upStr = fmt.Sprintf("%d 分钟", int(dur.Minutes()))
+	case dur < 24*time.Hour:
+		upStr = fmt.Sprintf("%d 小时 %d 分钟", int(dur.Hours()), int(dur.Minutes())%60)
+	default:
+		upStr = fmt.Sprintf("%d 天 %d 小时", int(dur.Hours())/24, int(dur.Hours())%24)
+	}
+
+	info(fmt.Sprintf("节点: %s%s%s", bold, hostName, reset))
+	info(fmt.Sprintf("启动: %s  (运行 %s)", bootTime, upStr))
+	if load != "" {
+		info(fmt.Sprintf("负载: %s   用户: %s", load, users))
+	}
+
+	if dur < time.Hour {
+		warn("登录节点近期重启 —— 之前的 tmux 会话很可能已丢失")
+	} else if load != "" {
+		if parts := strings.Split(load, ","); len(parts) > 0 {
+			if l1, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64); err == nil && l1 > 20 {
+				warn(fmt.Sprintf("1 分钟负载 %.2f 偏高，SSH 可能不稳定", l1))
+			}
+		}
+	}
+}
+
 func cmdHelp() {
 	fmt.Fprintf(os.Stderr, "\n  %s%sspod%s %s— SuperPod 会话管理%s\n\n", bold, cPurple, reset, cGray, reset)
 	fmt.Fprintf(os.Stderr, "  %s用法%s\n", bold, reset)
@@ -1646,6 +2034,8 @@ func cmdHelp() {
 		{"spod sync stop", "停止所有 rsync"},
 		{"spod speed [秒]", "VPN 隧道测速（默认 60s）"},
 		{"spod ssh", "裸 SSH（不用 tmux）"},
+		{"spod creds", "同步本地凭证到 SuperPod"},
+		{"spod uptime", "查看 login 节点启动时间和负载"},
 	}
 	for _, c := range cmds {
 		fmt.Fprintf(os.Stderr, "    %s%-22s%s %s%s%s\n", cBlue, c[0], reset, cGray, c[1], reset)
@@ -1744,6 +2134,10 @@ func main() {
 			dur = args[1]
 		}
 		cmdSpeedtest(dur)
+	case "creds":
+		cmdCreds()
+	case "uptime":
+		cmdUptime()
 	case "ssh":
 		ensureVPN()
 		if err := sshInteractive(); err != nil {

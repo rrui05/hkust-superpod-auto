@@ -145,6 +145,39 @@ def setup_credentials(user):
 
 # ─── Browser Login Automation ─────────────────────────────────────────
 
+def _dump_page_debug(page, label):
+    """Save screenshot + HTML + visible text for post-mortem. Safe to call on any page state.
+
+    Keeps only the 5 most recent triplets per label so a long-running
+    auto-reconnect loop with repeated MFA failures can't fill the disk.
+    Timestamp format YYYYMMDD-HHMMSS sorts lexicographically by time.
+    """
+    debug_dir = Path(__file__).resolve().parent
+    existing = sorted(debug_dir.glob(f"{label}-*.png"))
+    for old_png in existing[:-4]:  # keep newest 4, the new dump becomes the 5th
+        for ext in (".png", ".html", ".txt"):
+            old_png.with_suffix(ext).unlink(missing_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    try:
+        png = debug_dir / f"{label}-{ts}.png"
+        page.screenshot(path=str(png), full_page=True, timeout=10000)
+        log.warning(f"[!] Saved screenshot: {png.name}")
+    except Exception as ex:
+        log.warning(f"[!] Screenshot failed: {ex}")
+    try:
+        url = page.url
+        html_path = debug_dir / f"{label}-{ts}.html"
+        html_path.write_text(page.content(), encoding="utf-8")
+        txt_path = debug_dir / f"{label}-{ts}.txt"
+        txt_path.write_text(
+            page.evaluate("() => document.body ? document.body.innerText : ''"),
+            encoding="utf-8",
+        )
+        log.warning(f"[!] Saved HTML+text (url={url}): {html_path.name}, {txt_path.name}")
+    except Exception as ex:
+        log.warning(f"[!] HTML/text dump failed: {ex}")
+
+
 def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
     """Fully automated: open browser, login, MFA via TOTP, return DSID cookie.
 
@@ -157,18 +190,15 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
     log.info("[*] Starting automated VPN login...")
 
     with sync_playwright() as p:
-        launch_opts = {
-            "headless": headless,
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-            ],
-        }
+        # Use Firefox: headless Chromium stopped completing Microsoft's
+        # login SPA view transitions (button stays "Next" after email
+        # submit) — Firefox headless fires animationend reliably so the
+        # Knockout viewmodel advances to the password page normally.
+        launch_opts = {"headless": headless}
         if proxy:
             launch_opts["proxy"] = {"server": proxy}
-            launch_opts["args"].append(f"--proxy-server={proxy}")
 
-        browser = p.chromium.launch(**launch_opts)
+        browser = p.firefox.launch(**launch_opts)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -190,32 +220,69 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
             page.goto(VPN_URL, wait_until="domcontentloaded", timeout=60000)
 
             # ── Step 1: Enter email ──
+            # The Microsoft login form is hidden by Knockout data-bind
+            # "visible: !isLoginPageHidden()" until the login JS bundle
+            # (~470KB) finishes loading. Over a slow Clash proxy this
+            # can take >30s, so wait for the button to actually be
+            # visible before clicking, and fall back to JS submit.
             log.info("[*] Step 1/5: Entering email...")
-            page.wait_for_selector('input[name="loginfmt"]', timeout=30000)
+            page.wait_for_selector('input[name="loginfmt"]', state="visible", timeout=60000)
             page.fill('input[name="loginfmt"]', user)
             page.wait_for_timeout(300)
-            page.click("#idSIButton9")
-            page.wait_for_load_state("networkidle", timeout=15000)
+            try:
+                page.wait_for_selector("#idSIButton9", state="visible", timeout=60000)
+                page.click("#idSIButton9", timeout=10000)
+            except Exception as e:
+                _dump_page_debug(page, "step1-click-fail")
+                log.warning(f"[!] Step 1 click failed ({e}); falling back to JS submit")
+                page.evaluate("() => document.querySelector('#idSIButton9')?.click()")
+                page.wait_for_timeout(2000)
+            page.wait_for_load_state("networkidle", timeout=30000)
             log.info(f"[+] Email: {user}")
 
             # ── Step 2: Enter password ──
             log.info("[*] Step 2/5: Entering password...")
-            page.wait_for_selector('input[name="passwd"]', state="visible", timeout=15000)
+            try:
+                page.wait_for_selector('input[name="passwd"]', state="visible", timeout=45000)
+            except Exception:
+                _dump_page_debug(page, "step2-wait-passwd-fail")
+                raise
             page.wait_for_timeout(500)
             page.fill('input[name="passwd"]', password)
             page.wait_for_timeout(300)
-            page.click("#idSIButton9")
-            page.wait_for_load_state("networkidle", timeout=15000)
+            try:
+                page.wait_for_selector("#idSIButton9", state="visible", timeout=45000)
+                page.click("#idSIButton9", timeout=10000)
+            except Exception as e:
+                _dump_page_debug(page, "step2-click-fail")
+                log.warning(f"[!] Step 2 click failed ({e}); falling back to JS submit")
+                page.evaluate("() => document.querySelector('#idSIButton9')?.click()")
+                page.wait_for_timeout(2000)
+            page.wait_for_load_state("networkidle", timeout=30000)
             log.info("[+] Password entered.")
 
             # ── Step 3: On "Verify your identity" → click "Use a verification code" ──
             log.info("[*] Step 3/5: Switching to TOTP...")
-            page.wait_for_timeout(5000)
+
+            # Wait for MFA page content to actually render (text-based,
+            # robust against slow JS load). Falls through on timeout.
+            try:
+                page.wait_for_function(
+                    """() => {
+                        const t = document.body ? document.body.innerText : '';
+                        return t.includes('verification code')
+                            || t.includes('Approve a request')
+                            || t.includes('Verify your identity');
+                    }""",
+                    timeout=60000,
+                )
+            except Exception as e:
+                log.warning(f"[!] MFA page content did not appear in time: {e}")
 
             # Debug: screenshot + dump visible text for MFA page analysis
             debug_dir = Path(__file__).resolve().parent
             try:
-                page.screenshot(path=str(debug_dir / "mfa-debug.png"))
+                page.screenshot(path=str(debug_dir / "mfa-debug.png"), timeout=10000)
                 page_text = page.evaluate("() => document.body.innerText")
                 (debug_dir / "mfa-debug.txt").write_text(page_text)
                 log.info(f"[*] MFA page debug saved to mfa-debug.png/txt")
@@ -292,29 +359,36 @@ def get_dsid_cookie(user, password, totp_secret, proxy=None, headless=False):
 
             # ── Step 4: Enter TOTP code ──
             log.info("[*] Step 4/5: Entering TOTP code...")
-            page.wait_for_timeout(5000)  # extra wait for OTP input to render
 
             otp_input = None
             for otp_attempt in range(3):
                 try:
                     otp_input = page.wait_for_selector(
                         "#idTxtBx_SAOTCC_OTC, input[name='otc'], input[type='tel'], input[type='number']",
-                        timeout=10000,
+                        state="visible",
+                        timeout=20000,
                     )
-                    if otp_input and otp_input.is_visible():
+                    if otp_input:
                         break
                 except Exception:
                     log.info(f"[*] OTP input not ready, retry {otp_attempt+1}/3...")
                     page.wait_for_timeout(3000)
 
             if not otp_input:
+                _dump_page_debug(page, "step4-otp-missing")
                 raise Exception("OTP input field not found after retries")
 
             code = totp.now()
             otp_input.fill(code)
             page.wait_for_timeout(500)
-            page.click("#idSubmit_SAOTCC_Continue")
-            page.wait_for_load_state("networkidle", timeout=15000)
+            try:
+                page.wait_for_selector("#idSubmit_SAOTCC_Continue", state="visible", timeout=15000)
+                page.click("#idSubmit_SAOTCC_Continue", timeout=10000)
+            except Exception as e:
+                log.warning(f"[!] OTP submit click failed ({e}); falling back to JS")
+                page.evaluate("() => document.querySelector('#idSubmit_SAOTCC_Continue')?.click()")
+                page.wait_for_timeout(2000)
+            page.wait_for_load_state("networkidle", timeout=30000)
             log.info(f"[+] TOTP code: {code}")
 
             # ── Step 5: "Stay signed in?" → Yes ──
@@ -461,6 +535,20 @@ def _apply_dns_entry(host, ip, sudo_password):
     )
 
 
+def _wait_tun0_ready(timeout=30):
+    """Block until tun0 interface exists and is UP, so `ip route ... dev tun0` won't silently fail."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with open("/sys/class/net/tun0/operstate") as f:
+                if f.read().strip() in ("up", "unknown"):  # point-to-point shows "unknown"
+                    return True
+        except FileNotFoundError:
+            pass
+        time.sleep(0.5)
+    return False
+
+
 def fix_vpn_dns(hosts, sudo_password, vpn_dns="143.89.14.7", retries=15):
     """Resolve hosts via VPN DNS and add /etc/hosts entries + routes.
 
@@ -470,6 +558,12 @@ def fix_vpn_dns(hosts, sudo_password, vpn_dns="143.89.14.7", retries=15):
     Uses a local cache file (.dns-cache.json) to skip DNS queries for
     hosts with known stable IPs (e.g. university HPC clusters).
     """
+    # Wait for openconnect to bring tun0 up — otherwise `ip route ... dev tun0`
+    # silently fails and split-tunnel traffic falls back to the default route.
+    if not _wait_tun0_ready():
+        log.warning("[!] DNS fix: tun0 did not come up within 30s")
+        return False
+
     cache = _load_dns_cache()
     resolved = set()
 
@@ -613,14 +707,6 @@ def connect_vpn(dsid, proxy=None, hosts=None, sudo_password=None):
         )
         dns_thread.start()
 
-        # Health check in background
-        health_thread = threading.Thread(
-            target=_health_check,
-            args=(hosts,),
-            daemon=True,
-        )
-        health_thread.start()
-
         # Read and log openconnect output
         for line in proc.stdout:
             text = line.decode("utf-8", errors="replace").rstrip()
@@ -643,6 +729,16 @@ def auto_reconnect(user, password, totp_secret, sudo_password,
       - Inactivity timeout: 30 min
       - Max session length: 240 min (4 hours)
     """
+    # Health check runs once for the lifetime of the process; previously it
+    # was restarted inside connect_vpn() on every reconnect, leaking one
+    # daemon thread per 4-hour session and accumulating concurrent SSH
+    # probes against the SuperPod login service.
+    threading.Thread(
+        target=_health_check,
+        args=(hosts or DEFAULT_HOSTS,),
+        daemon=True,
+    ).start()
+
     attempt = 0
     consecutive_login_failures = 0
 
